@@ -1,3 +1,15 @@
+#!/usr/bin/env python
+"""
+Pyramid Vision Transformer (PVT) implementation.
+
+This module implements the Pyramid Vision Transformer architecture with
+spatial reduction attention for efficient processing of high-resolution images.
+
+Reference:
+    Wang et al., "Pyramid Vision Transformer: A Versatile Backbone for Dense 
+    Prediction without Convolutions", ICCV 2021.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,15 +24,36 @@ __all__ = [
 
 
 def _cfg(url='', **kwargs):
+    """Default configuration for PVT models."""
     return {
-        'url': url, 'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None,
-        'crop_pct': .9, 'interpolation': 'bicubic', 'mean': (0.485, 0.456, 0.406), 
-        'std': (0.229, 0.224, 0.225), 'classifier': 'head', **kwargs
+        'url': url,
+        'num_classes': 1000,
+        'input_size': (3, 224, 224),
+        'pool_size': None,
+        'crop_pct': 0.9,
+        'interpolation': 'bicubic',
+        'mean': (0.485, 0.456, 0.406),
+        'std': (0.229, 0.224, 0.225),
+        'classifier': 'head',
+        **kwargs
     }
 
 
+# =============================================================================
+# Building Blocks
+# =============================================================================
+
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    """Multi-layer perceptron with GELU activation."""
+    
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int = None,
+        out_features: int = None,
+        act_layer=nn.GELU,
+        drop: float = 0.
+    ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features

@@ -1,39 +1,54 @@
+#!/usr/bin/env python
+"""
+Fine-tuning script for MMST-ViT crop yield prediction model.
+
+This script fine-tunes the MMST-ViT (Multi-Modal Spatio-Temporal Vision Transformer)
+model for crop yield prediction using satellite imagery, weather data, and historical
+USDA crop statistics.
+
+Usage:
+    python main_finetune_mmst_vit.py \
+        --root_dir /path/to/data \
+        --data_file_train ./data/soybean_train.json \
+        --data_file_val ./data/soybean_val.json \
+        --pvt_simclr ./output_dir/pvt_simclr/checkpoint.pth \
+        --batch_size 64 \
+        --epochs 200
+"""
+
 import argparse
 import datetime
 import json
 import math
-import sys
-
-import numpy as np
 import os
+import sys
 import time
 from pathlib import Path
+from typing import Iterable
 
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from einops import rearrange
 from torch.utils.tensorboard import SummaryWriter
-
 import timm.optim as optim_factory
 
-import util.misc as misc
 from dataset.data_wrapper import DataWrapper
-from dataset.hrrr_loader import HRRR_Dataset
-from dataset.sentinel_loader import Sentinel_Dataset
-from dataset.usda_loader import USDA_Dataset
-from util.misc import NativeScalerWithGradNormCount as NativeScaler
+from dataset.hrrr_loader import HRRRDataset
+from dataset.sentinel_loader import SentinelDataset
+from dataset.usda_loader import USDADataset
+from models_mmst_vit import MMSTViT
 from models_pvt_simclr import PVTSimCLR
-from typing import Iterable
 import util.lr_sched as lr_sched
-from models_mmst_vit import MMST_ViT
-from util import metrics
+import util.metrics as metrics
+import util.misc as misc
+from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
-from datetime import datetime
-
+# Set random seeds for reproducibility
 torch.manual_seed(0)
 np.random.seed(0)
 
-# RMSE, R_Squared, Corr
+# Best metrics tracker: [RMSE (lower is better), R² (higher is better), Corr (higher is better)]
 best_metrics = [float("inf"), 0, 0]
 
 
@@ -73,68 +88,82 @@ def get_args_parser():
     parser.add_argument('--log_dir', default='./output_dir/mmst_vit',
                         help='path where to tensorboard log')
     parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
-    parser.add_argument('--seed', default=0, type=int)
+                        help='Device to use for training/testing')
+    parser.add_argument('--seed', default=0, type=int,
+                        help='Random seed for reproducibility')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-                        help='start epoch')
-    parser.add_argument('--num_workers', default=10, type=int)
+                        help='Start epoch (for resuming)')
+    parser.add_argument('--num_workers', default=4, type=int,
+                        help='Number of data loading workers')
     parser.add_argument('--pin_mem', action='store_true',
-                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+                        help='Pin CPU memory in DataLoader')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
 
-    # distributed training parameters
+    # Distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist_on_itp', action='store_true')
+                        help='Number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int,
+                        help='Local rank for distributed training')
+    parser.add_argument('--dist_on_itp', action='store_true',
+                        help='Use ITP distributed training')
     parser.add_argument('--dist_url', default='env://',
-                        help='url used to set up distributed training')
+                        help='URL for distributed training setup')
 
-    # dataset
-    parser.add_argument('-dr', '--root_dir', type=str, default='/mnt/data/Tiny CropNet')
-    parser.add_argument('-sf', '--save_freq', type=int, default=2)
+    # Dataset paths
+    parser.add_argument('--root_dir', '-dr', type=str, default='/mnt/data/Tiny CropNet',
+                        help='Root directory containing the dataset')
+    parser.add_argument('--save_freq', '-sf', type=int, default=2,
+                        help='Checkpoint save frequency (epochs)')
 
-    # train and val
-    parser.add_argument('-dft', '--data_file_train', type=str, default='./data/soybean_train.json')
-    parser.add_argument('-dfv', '--data_file_val', type=str, default='./data/soybean_val.json')
+    # Training and validation data files
+    parser.add_argument('--data_file_train', '-dft', type=str, default='./data/soybean_train.json',
+                        help='Path to training data index JSON file')
+    parser.add_argument('--data_file_val', '-dfv', type=str, default='./data/soybean_val.json',
+                        help='Path to validation data index JSON file')
 
-    # pvt_simclr
-    parser.add_argument('--pvt_simclr', default='', help='load from checkpoint')
+    # Pre-trained backbone
+    parser.add_argument('--pvt_simclr', default='',
+                        help='Path to pre-trained PVT-SimCLR checkpoint')
 
-    # evaluate
-    parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    parser.add_argument('--eval_year', type=int, default=2022, help='specify the year for prediction')
+    # Evaluation options
+    parser.add_argument('--eval', action='store_true',
+                        help='Run evaluation only (no training)')
+    parser.add_argument('--eval_year', type=int, default=2022,
+                        help='Year for evaluation prediction')
 
-    # resume
-    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    # Resume training
+    parser.add_argument('--resume', default='',
+                        help='Path to checkpoint to resume from')
 
     return parser
 
 
 def main(args):
+    """Main training/evaluation function."""
     misc.init_distributed_mode(args)
 
-    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(', ', ',\n'))
+    print(f"Job directory: {os.path.dirname(os.path.realpath(__file__))}")
+    print(f"Arguments:\n{str(args).replace(', ', ',\n')}")
 
     device = torch.device(args.device)
 
-    # fix the seed for reproducibility
+    # Set random seed for reproducibility
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     cudnn.benchmark = True
 
-    dataset_sentinel_train = Sentinel_Dataset(args.root_dir, args.data_file_train)
-    dataset_hrrr_train = HRRR_Dataset(args.root_dir, args.data_file_train)
-    dataset_usda_train = USDA_Dataset(args.root_dir, args.data_file_train)
+    # Initialize datasets
+    dataset_sentinel_train = SentinelDataset(args.root_dir, args.data_file_train)
+    dataset_hrrr_train = HRRRDataset(args.root_dir, args.data_file_train)
+    dataset_usda_train = USDADataset(args.root_dir, args.data_file_train)
 
-    dataset_sentinel_val = Sentinel_Dataset(args.root_dir, args.data_file_val)
-    dataset_hrrr_val = HRRR_Dataset(args.root_dir, args.data_file_val)
-    dataset_usda_val = USDA_Dataset(args.root_dir, args.data_file_val)
+    dataset_sentinel_val = SentinelDataset(args.root_dir, args.data_file_val)
+    dataset_hrrr_val = HRRRDataset(args.root_dir, args.data_file_val)
+    dataset_usda_val = USDADataset(args.root_dir, args.data_file_val)
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -233,11 +262,11 @@ def main(args):
         pvt.to(device)
         pvt.eval()
 
-    model = MMST_ViT(out_dim=2, pvt_backbone=pvt, context_dim=9, dim=args.embed_dim, batch_size=args.batch_size)
+    model = MMSTViT(out_dim=2, pvt_backbone=pvt, context_dim=9, dim=args.embed_dim, batch_size=args.batch_size)
     model.to(device)
 
     model_without_ddp = model
-    print("Model = %s" % str(model_without_ddp))
+    print(f"Model: {model_without_ddp}")
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
 

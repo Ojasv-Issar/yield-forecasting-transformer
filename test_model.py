@@ -6,11 +6,11 @@ This doesn't require the full dataset - it uses random tensors.
 
 import torch
 from models_pvt_simclr import PVTSimCLR
-from models_mmst_vit import MMST_ViT
+from models_mmst_vit import MMSTViT
 
 
 def test_pvt_simclr():
-    """Test PVT SimCLR backbone model"""
+    """Test PVT SimCLR backbone model."""
     print("=" * 50)
     print("Testing PVT SimCLR model...")
     print("=" * 50)
@@ -38,7 +38,7 @@ def test_pvt_simclr():
 
 
 def test_mmst_vit():
-    """Test full MMST-ViT model"""
+    """Test full MMST-ViT model."""
     print("=" * 50)
     print("Testing MMST-ViT model...")
     print("=" * 50)
@@ -48,17 +48,17 @@ def test_mmst_vit():
     
     # Create MMST-ViT model
     # Note: num_grid should be >= actual_grids + 1 (for cls token)
-    model = MMST_ViT(
+    model = MMSTViT(
         out_dim=4,  # 4 output features (could be yield predictions)
         pvt_backbone=pvt,
         dim=512,
-        num_grid=64,  # maximum number of spatial grids (must be >= actual grids used)
+        num_grid=64,  # Maximum number of spatial grids (must be >= actual grids used)
         num_short_term_seq=6,  # 6 short-term time steps (e.g., 6 months)
         num_long_term_seq=12,  # 12 long-term time steps
         num_year=5,  # 5 years of historical data
         batch_size=32
     )
-    print(f"Model created: MMST-ViT")
+    print("Model created: MMST-ViT")
     
     # Create random inputs
     # x: satellite imagery (B, T, G, C, H, W)

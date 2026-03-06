@@ -1,30 +1,43 @@
+#!/usr/bin/env python
+"""
+Pre-training script for PVT-SimCLR backbone using contrastive learning.
+
+This script pre-trains the Pyramid Vision Transformer (PVT) backbone using SimCLR
+contrastive learning on satellite imagery and weather data. The pre-trained backbone
+can then be used in the MMST-ViT model for crop yield prediction.
+
+Usage:
+    python main_pretrain_mmst_vit.py \
+        --root_dir /path/to/data \
+        --data_file ./data/soybean_train.json \
+        --batch_size 32 \
+        --epochs 200
+"""
+
 import argparse
 import datetime
 import json
 import math
-import sys
-
-import numpy as np
 import os
+import sys
 import time
 from pathlib import Path
+from typing import Iterable
 
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-
 import timm.optim as optim_factory
-from tqdm import tqdm
 
-import util.misc as misc
-from dataset.hrrr_loader import HRRR_Dataset
-from dataset.sentinel_loader import Sentinel_Dataset
-from loss.contrastive_loss import ContrastiveLoss
-from util.misc import NativeScalerWithGradNormCount as NativeScaler
-from models_pvt_simclr import PVTSimCLR
-from typing import Iterable
-import util.lr_sched as lr_sched
 from dataset import sentinel_wrapper
+from dataset.hrrr_loader import HRRRDataset
+from dataset.sentinel_loader import SentinelDataset
+from loss.contrastive_loss import ContrastiveLoss
+from models_pvt_simclr import PVTSimCLR
+import util.lr_sched as lr_sched
+import util.misc as misc
+from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 
 def get_args_parser():
@@ -64,53 +77,62 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_dir/pvt_simclr',
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda:1',
-                        help='device to use for training / testing')
-    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--device', default='cuda',
+                        help='Device to use for training/testing')
+    parser.add_argument('--seed', default=0, type=int,
+                        help='Random seed for reproducibility')
     parser.add_argument('--resume', default='',
-                        help='resume from checkpoint')
+                        help='Path to checkpoint to resume from')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-                        help='start epoch')
-    parser.add_argument('--num_workers', default=10, type=int)
+                        help='Start epoch (for resuming)')
+    parser.add_argument('--num_workers', default=4, type=int,
+                        help='Number of data loading workers')
     parser.add_argument('--pin_mem', action='store_true',
-                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+                        help='Pin CPU memory in DataLoader')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
 
-    # distributed training parameters
+    # Distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist_on_itp', action='store_true')
+                        help='Number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int,
+                        help='Local rank for distributed training')
+    parser.add_argument('--dist_on_itp', action='store_true',
+                        help='Use ITP distributed training')
     parser.add_argument('--dist_url', default='env://',
-                        help='url used to set up distributed training')
+                        help='URL for distributed training setup')
 
-    # dataset
-    parser.add_argument('-dr', '--root_dir', type=str, default='/mnt/data/Tiny CropNet')
-    parser.add_argument('-tf', '--data_file', type=str, default='./data/soybean_train.json')
-    parser.add_argument('-sf', '--save_freq', type=int, default=5)
+    # Dataset paths
+    parser.add_argument('--root_dir', '-dr', type=str, default='/mnt/data/Tiny CropNet',
+                        help='Root directory containing the dataset')
+    parser.add_argument('--data_file', '-tf', type=str, default='./data/soybean_train.json',
+                        help='Path to training data index JSON file')
+    parser.add_argument('--save_freq', '-sf', type=int, default=5,
+                        help='Checkpoint save frequency (epochs)')
 
     return parser
 
 
 def main(args):
+    """Main training function."""
     misc.init_distributed_mode(args)
 
-    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(', ', ',\n'))
+    print(f"Job directory: {os.path.dirname(os.path.realpath(__file__))}")
+    print(f"Arguments:\n{str(args).replace(', ', ',\n')}")
 
     device = torch.device(args.device)
 
-    # fix the seed for reproducibility
+    # Set random seed for reproducibility
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     cudnn.benchmark = True
 
-    dataset_sentinel = Sentinel_Dataset(args.root_dir, args.data_file)
-    dataset_hrrr = HRRR_Dataset(args.root_dir, args.data_file)
+    # Initialize datasets
+    dataset_sentinel = SentinelDataset(args.root_dir, args.data_file)
+    dataset_hrrr = HRRRDataset(args.root_dir, args.data_file)
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
